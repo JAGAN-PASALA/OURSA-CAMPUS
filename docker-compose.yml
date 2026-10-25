@@ -1,0 +1,50 @@
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: smart_classroom
+      MYSQL_USER: smartclassroom
+      MYSQL_PASSWORD: local-dev-only
+      MYSQL_ROOT_PASSWORD: local-root-only
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-plocal-root-only"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      APP_SECRET: docker-development-secret-change-before-deployment
+      DATABASE_URL: mysql+pymysql://smartclassroom:local-dev-only@db:3306/smart_classroom?charset=utf8mb4
+      CORS_ORIGINS: http://localhost:5173
+      SEED_DEMO_DATA: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ai_models:/app/models
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ""
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "5173:5173"
+
+volumes:
+  mysql_data:
+  ai_models:

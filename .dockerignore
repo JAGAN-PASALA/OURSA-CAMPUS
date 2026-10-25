@@ -1,0 +1,15 @@
+.git
+node_modules
+dist
+.next
+.venv
+.test-venv
+.test-artifacts
+.env*
+backend/data
+backend/models
+backend/__pycache__
+output
+tmp
+*.pyc
+SmartClassroom.zip

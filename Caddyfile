@@ -1,0 +1,35 @@
+{
+  email {$ACME_EMAIL}
+  admin off
+}
+
+{$PUBLIC_DOMAINS} {
+  encode zstd gzip
+  request_body {
+    max_size 25MB
+  }
+
+  @api path /api/*
+  handle @api {
+    reverse_proxy backend:8000
+  }
+
+  handle {
+    reverse_proxy frontend:5173
+  }
+
+  header {
+    -Server
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(self), microphone=(), geolocation=(), payment=(self)"
+    Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' https://checkout.razorpay.com; connect-src 'self' https://*.razorpay.com https://firebaseinstallations.googleapis.com https://fcmregistrations.googleapis.com https://fcm.googleapis.com; frame-src https://*.razorpay.com; img-src 'self' data: blob: https://*.razorpay.com; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; upgrade-insecure-requests"
+  }
+
+  log {
+    output stdout
+    format json
+  }
+}
