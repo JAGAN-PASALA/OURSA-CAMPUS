@@ -72,3 +72,5 @@ ios/App/App/GoogleService-Info.plist
 
 # Logs
 *.log
+
+database-backup/

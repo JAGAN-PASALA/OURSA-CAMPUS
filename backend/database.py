@@ -1,3 +1,4 @@
+import os
 import json
 import math
 import hashlib
@@ -74,6 +75,24 @@ from privacy import decrypt_embedding, decrypt_secret, encrypt_embedding, encryp
 settings = get_settings()
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine_options = {"pool_pre_ping": True, "connect_args": connect_args}
+if settings.database_url.startswith("mysql+pymysql://"):
+    ca_setting = os.environ.get("AIVEN_CA_CERT")
+
+    if ca_setting:
+        from pathlib import Path
+
+        ca_path = Path(ca_setting)
+        if not ca_path.is_absolute():
+            ca_path = Path(__file__).resolve().parent.parent / ca_path
+
+        if not ca_path.is_file():
+            raise FileNotFoundError(f"AIVEN_CA_CERT file not found: {ca_path}")
+
+        connect_args.update(
+            ssl_ca=str(ca_path),
+            ssl_verify_cert=True,
+            ssl_verify_identity=True,
+        )
 if not settings.database_url.startswith("sqlite"):
     engine_options.update(
         pool_recycle=settings.db_pool_recycle_seconds,
