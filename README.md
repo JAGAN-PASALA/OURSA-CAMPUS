@@ -1,4 +1,4 @@
-# OUR'S Smart Classroom Platform v8.2 Security Update
+# OURSA CAMPUS 
 
 ## v8.2 security changes
 
