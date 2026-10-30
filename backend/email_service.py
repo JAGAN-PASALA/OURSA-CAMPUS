@@ -49,3 +49,41 @@ def send_configuration_test(recipient: str, institution_name: str) -> tuple[bool
     message["To"] = recipient
     message.set_content("Your OUR'S Smart Classroom email configuration is working.")
     return _send(message)
+
+
+def send_student_welcome_email(
+    recipient: str,
+    recipient_name: str,
+    role: str,
+    institution_name: str,
+    institution_slug: str,
+) -> tuple[bool, str | None]:
+    from urllib.parse import urlencode
+
+    base_url = settings.frontend_base_url.rstrip("/")
+    login_url = f"{base_url}?{urlencode({'institution': institution_slug})}"
+
+    message = EmailMessage()
+    message["Subject"] = f"Welcome to {institution_name} – Your Account Details"
+    message["From"] = settings.smtp_from_email
+    message["To"] = recipient
+    message.set_content(
+        f"Hello {recipient_name},\n\n"
+        f"We are pleased to inform you that your account has been successfully "
+        f"created on {institution_name}!\n\n"
+        "Here are your account details:\n\n"
+        f"Role: {role}\n"
+        f"Registered Email: {recipient}\n"
+        "Initial Password: Use the temporary password provided by your institution's administrator, if one was supplied. Otherwise, use your date of birth in DDMMYYYY format.\n"
+        "Example: If your date of birth is 15 August 2005 and no temporary password was provided, enter 15082005.\n"
+        f"Login Link: {login_url}\n\n"
+        "For your security, please log in using the above details and change "
+        "your default password immediately after your first login.\n\n"
+        "If you experience any issues accessing your account, please contact "
+        "your institution's administration team for assistance.\n\n"
+        f"We are happy to welcome you to {institution_name} and wish you a "
+        "wonderful experience!\n\n"
+        "Warm regards,\n"
+        "Team OURSA CAMPUS"
+    )
+    return _send(message)

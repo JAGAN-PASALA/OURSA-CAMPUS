@@ -74,3 +74,6 @@ ios/App/App/GoogleService-Info.plist
 *.log
 
 database-backup/
+
+# Private credentials
+secrets/

@@ -22,7 +22,7 @@ from main import app
 import main
 import database as db
 from config import Settings
-from models import AttendanceCorrection, BehaviourModelVersion, BehaviourObservation, ClassSession, Department, NotificationDelivery, PasswordResetToken, SectionMembership, SessionAttendance, StaffProfile, Student, User
+from models import AcademicProgressionBatch, AcademicProgressionRecord, AttendanceCorrection, BehaviourModelVersion, BehaviourObservation, ClassSession, Department, Enrollment, NotificationDelivery, PasswordResetToken, SectionMembership, SessionAttendance, StaffProfile, Student, StudentProfile, User
 from privacy import decrypt_embedding, encrypt_embedding
 
 
@@ -1078,3 +1078,259 @@ def test_login_records_terms_acceptance_version():
             accepted = session.query(UserLegalAcceptance).filter_by(user_id=user.id).all()
             assert accepted
             assert accepted[-1].document_version == main.LEGAL_DOCUMENT_VERSION
+
+
+def _progression_test_setup(client):
+    catalog_response = client.get("/api/admin/academics/catalog")
+    assert catalog_response.status_code == 200, catalog_response.text
+    catalog = catalog_response.json()
+
+    source_term = next(
+        (row for row in catalog["terms"] if row["name"] == "Semester 5"),
+        None,
+    )
+    assert source_term is not None, "Seeded Semester 5 source term was not found"
+
+    with db.SessionLocal() as session:
+        student = session.query(Student).join(User, Student.user_id == User.id).filter(User.name == "Arjun Kumar").one()
+        student_id = student.id
+        source_membership = session.query(SectionMembership).filter_by(
+            student_id=student_id,
+            term_id=source_term["id"],
+            active=True,
+        ).one()
+        source_section_id = source_membership.section_id
+
+    today = datetime.now(timezone.utc).date()
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+
+    destination_term_response = client.post(
+        "/api/admin/academics/terms",
+        json={
+            "name": f"Progression {suffix}",
+            "academic_year": f"{today.year}-{today.year + 1}",
+            "start_date": str(today),
+            "end_date": str(today + timedelta(days=120)),
+        },
+    )
+    assert destination_term_response.status_code == 201, destination_term_response.text
+    destination_term = destination_term_response.json()
+
+    destination_section_response = client.post(
+        "/api/admin/academics/sections",
+        json={
+            "name": f"PG-{suffix}",
+            "department": "CSE",
+            "semester": 6,
+            "batch_year": today.year - 2,
+        },
+    )
+    assert destination_section_response.status_code == 201, destination_section_response.text
+    destination_section = destination_section_response.json()
+
+    return {
+        "catalog": catalog,
+        "student_id": student_id,
+        "source_term": source_term,
+        "source_section_id": source_section_id,
+        "destination_term": destination_term,
+        "destination_section": destination_section,
+        "suffix": suffix,
+    }
+
+
+def _propose_progression_batch(client, case):
+    response = client.post(
+        "/api/admin/academics/progression-batches",
+        json={
+            "student_ids": [case["student_id"]],
+            "source_term_id": case["source_term"]["id"],
+            "destination_term_id": case["destination_term"]["id"],
+            "destination_section_id": case["destination_section"]["id"],
+            "reason": "Isolated academic progression test",
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_progression_pending_batch_does_not_move_student():
+    with TestClient(app) as client:
+        login(client, "admin@example.com", "Admin@123")
+        case = _progression_test_setup(client)
+        batch_data = _propose_progression_batch(client, case)
+
+        assert batch_data["status"] == "pending"
+
+        with db.SessionLocal() as session:
+            source_membership = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                section_id=case["source_section_id"],
+                term_id=case["source_term"]["id"],
+                active=True,
+            ).one_or_none()
+            destination_memberships = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                term_id=case["destination_term"]["id"],
+                active=True,
+            ).all()
+            batch = session.get(AcademicProgressionBatch, batch_data["id"])
+            records = session.query(AcademicProgressionRecord).filter_by(
+                batch_id=batch_data["id"]
+            ).all()
+
+            assert source_membership is not None
+            assert destination_memberships == []
+            assert batch.status == "pending"
+            assert len(records) == 1
+            assert records[0].status == "pending"
+
+
+def test_progression_rejection_keeps_placement_and_prevents_second_review():
+    with TestClient(app) as client:
+        login(client, "admin@example.com", "Admin@123")
+        case = _progression_test_setup(client)
+        batch_data = _propose_progression_batch(client, case)
+
+        rejected = client.patch(
+            f"/api/admin/academics/progression-batches/{batch_data['id']}/review",
+            json={"decision": "rejected", "reason": "Rejected by isolated test"},
+        )
+        assert rejected.status_code == 200, rejected.text
+        assert rejected.json()["status"] == "rejected"
+        assert rejected.json()["students_updated"] == 0
+
+        retry = client.patch(
+            f"/api/admin/academics/progression-batches/{batch_data['id']}/review",
+            json={"decision": "approved", "reason": "Attempt after rejection"},
+        )
+        assert retry.status_code == 409, retry.text
+
+        with db.SessionLocal() as session:
+            source_membership = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                section_id=case["source_section_id"],
+                term_id=case["source_term"]["id"],
+                active=True,
+            ).one_or_none()
+            destination_memberships = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                term_id=case["destination_term"]["id"],
+                active=True,
+            ).all()
+            batch = session.get(AcademicProgressionBatch, batch_data["id"])
+            record = session.query(AcademicProgressionRecord).filter_by(
+                batch_id=batch_data["id"],
+                student_id=case["student_id"],
+            ).one()
+
+            assert source_membership is not None
+            assert destination_memberships == []
+            assert batch.status == "rejected"
+            assert record.status == "rejected"
+            assert record.applied_at is None
+
+
+def test_progression_approval_preserves_source_history_and_course_progress():
+    with TestClient(app) as client:
+        login(client, "admin@example.com", "Admin@123")
+        case = _progression_test_setup(client)
+
+        with db.SessionLocal() as session:
+            existing_enrollment = session.query(Enrollment).filter_by(
+                student_id=case["student_id"]
+            ).first()
+            assert existing_enrollment is not None, "Seeded student needs an enrollment"
+            existing_enrollment_id = existing_enrollment.id
+            existing_course_id = existing_enrollment.course_id
+            existing_enrollment.completed_lessons = 4
+            existing_enrollment.score = 71.5
+            session.commit()
+
+        course_response = client.post(
+            "/api/admin/courses",
+            json={
+                "title": f"Progression Test Course {case['suffix']}",
+                "code": f"PG{case['suffix']}",
+                "total_lessons": 8,
+            },
+        )
+        assert course_response.status_code == 201, course_response.text
+        new_course_id = course_response.json()["id"]
+
+        assignments = case["catalog"]["assignments"]
+        assert assignments, "Seeded teacher assignment is required for this test"
+        teacher_id = assignments[0]["teacher_id"]
+
+        assignment_response = client.post(
+            "/api/admin/academics/assignments",
+            json={
+                "teacher_id": teacher_id,
+                "course_id": new_course_id,
+                "section_id": case["destination_section"]["id"],
+                "term_id": case["destination_term"]["id"],
+            },
+        )
+        assert assignment_response.status_code == 201, assignment_response.text
+
+        batch_data = _propose_progression_batch(client, case)
+        approved = client.patch(
+            f"/api/admin/academics/progression-batches/{batch_data['id']}/review",
+            json={"decision": "approved", "reason": "Approved by isolated test"},
+        )
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["status"] == "approved"
+        assert approved.json()["students_updated"] == 1
+
+        repeat = client.patch(
+            f"/api/admin/academics/progression-batches/{batch_data['id']}/review",
+            json={"decision": "approved", "reason": "Repeated approval"},
+        )
+        assert repeat.status_code == 409, repeat.text
+
+        with db.SessionLocal() as session:
+            source_membership = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                section_id=case["source_section_id"],
+                term_id=case["source_term"]["id"],
+            ).one_or_none()
+            destination_membership = session.query(SectionMembership).filter_by(
+                student_id=case["student_id"],
+                section_id=case["destination_section"]["id"],
+                term_id=case["destination_term"]["id"],
+                active=True,
+            ).one_or_none()
+            old_enrollment = session.get(Enrollment, existing_enrollment_id)
+            new_enrollment = session.query(Enrollment).filter_by(
+                student_id=case["student_id"],
+                course_id=new_course_id,
+            ).one_or_none()
+            batch = session.get(AcademicProgressionBatch, batch_data["id"])
+            record = session.query(AcademicProgressionRecord).filter_by(
+                batch_id=batch_data["id"],
+                student_id=case["student_id"],
+            ).one()
+            profile = session.query(StudentProfile).filter_by(
+                student_id=case["student_id"]
+            ).one_or_none()
+
+            assert source_membership is not None
+            assert source_membership.active is True
+            assert destination_membership is not None
+            assert batch.status == "approved"
+            assert record.status == "approved"
+            assert record.applied_at is not None
+
+            assert old_enrollment is not None
+            assert old_enrollment.course_id == existing_course_id
+            assert old_enrollment.completed_lessons == 4
+            assert old_enrollment.score == 71.5
+
+            assert new_enrollment is not None
+            assert new_enrollment.completed_lessons == 0
+            assert new_enrollment.score == 0
+
+            if profile is not None:
+                assert profile.current_semester == case["destination_term"]["name"]
+                assert profile.current_academic_year == case["destination_term"]["academic_year"]
+                assert profile.section_name == case["destination_section"]["name"]

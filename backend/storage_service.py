@@ -36,7 +36,7 @@ def scan_bytes(payload: bytes) -> str:
         return "unavailable"
     if "FOUND" in response:
         return "infected"
-    return "clean" if response.rstrip().endswith("OK") else "unavailable"
+    return "clean" if response.rstrip("\x00\r\n ").endswith("OK") else "unavailable"
 
 
 def _client():
@@ -102,6 +102,23 @@ def download_url(key: str, expires_seconds: int = 300) -> str:
         Params={"Bucket": settings.object_storage_bucket, "Key": key},
         ExpiresIn=expires_seconds,
     )
+
+
+def read_private(key: str) -> bytes:
+    """Read a private object without exposing its storage URL."""
+    local = local_path(key)
+    if local:
+        return local.read_bytes()
+
+    response = _client().get_object(
+        Bucket=get_settings().object_storage_bucket,
+        Key=key,
+    )
+    body = response["Body"]
+    try:
+        return body.read()
+    finally:
+        body.close()
 
 
 def local_path(key: str) -> Path | None:

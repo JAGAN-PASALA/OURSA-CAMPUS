@@ -72,31 +72,46 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: rustfs/rustfs:latest
     restart: unless-stopped
-    command: ["server", "/data", "--console-address", ":9001"]
+    command: ["/data"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
-    volumes: [object_data:/data]
+      RUSTFS_ACCESS_KEY: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      RUSTFS_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      RUSTFS_SSE_S3_MASTER_KEY: ${RUSTFS_SSE_S3_MASTER_KEY:?Set RUSTFS_SSE_S3_MASTER_KEY}
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: "info"
+    volumes: [rustfs_data:/data]
     networks: [database]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 20
+      start_period: 40s
     security_opt: ["no-new-privileges:true"]
 
   minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: amazon/aws-cli:2.38.6
     depends_on:
       minio:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: ["mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD && mc mb --ignore-existing local/$$OBJECT_STORAGE_BUCKET && mc anonymous set none local/$$OBJECT_STORAGE_BUCKET"]
+    command:
+      - |
+        printf '[default]\ns3 =\n  addressing_style = path\n' > "$$AWS_CONFIG_FILE"
+        if aws --endpoint-url http://minio:9000 s3api head-bucket --bucket "$$OBJECT_STORAGE_BUCKET" >/dev/null 2>&1; then
+          echo "Object-storage bucket already exists."
+        else
+          aws --endpoint-url http://minio:9000 s3api create-bucket --bucket "$$OBJECT_STORAGE_BUCKET"
+        fi
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_CONFIG_FILE: /tmp/aws-config
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-ours-private}
     networks: [database]
 
@@ -232,6 +247,8 @@ services:
     security_opt: ["no-new-privileges:true"]
 
 volumes:
+  rustfs_data:
+
   mysql_data:
   backend_data:
   ai_models:

@@ -217,6 +217,19 @@ class TeacherReplacement(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class ProgressionBatchCreate(BaseModel):
+    student_ids: list[int] = Field(min_length=1, max_length=500)
+    source_term_id: int = Field(gt=0)
+    destination_term_id: int = Field(gt=0)
+    destination_section_id: int = Field(gt=0)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class ProgressionBatchReview(BaseModel):
+    decision: Literal["approved", "rejected"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 class SectionMembershipCreate(BaseModel):
     student_id: int = Field(gt=0)
     section_id: int = Field(gt=0)

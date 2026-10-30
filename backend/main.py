@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Respon
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from urllib.parse import quote
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -40,6 +41,8 @@ from ml_service import vision
 from timetable_service import timetable_access, semester_dates, campus_today, register_routes as register_timetable_routes
 from models import (
     AcademicTerm,
+    AcademicProgressionBatch,
+    AcademicProgressionRecord,
     Announcement,
     Assessment,
     AssessmentAttempt,
@@ -100,6 +103,8 @@ from schemas import (
     AssessmentUpdate,
     AssessmentStatusUpdate,
     AcademicTermUpdate,
+    ProgressionBatchCreate,
+    ProgressionBatchReview,
     AttendanceCorrectionCreate,
     AttendanceOverride,
     AttemptAutosave,
@@ -344,6 +349,99 @@ def flush_or_conflict(session: Session, message: str) -> None:
         session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, message) from exc
 
+
+def send_student_welcome_notification(session: Session, student: Student) -> None:
+    """Create an in-app welcome notice and independently send the welcome email."""
+    institution = session.get(Institution, student.institution_id)
+    user = student.user
+
+    if not institution or not user:
+        logger.warning(
+            "Welcome notification skipped: missing institution or user for student_id=%s",
+            student.id,
+        )
+        return
+
+    # Keep the in-app notification independent from email delivery and deduplication.
+    try:
+        db.add_notification(
+            session,
+            institution_id=institution.id,
+            user_id=user.id,
+            student_id=student.id,
+            template="student_welcome",
+            message=(
+                f"Welcome to {institution.name}, {user.name}! "
+                "Your student account has been created. "
+                "Sign in to access your campus services."
+            ),
+            dedup_key=f"student-welcome-in-app:{student.id}",
+            push_category="security",
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "In-app welcome notification failed for student_id=%s",
+            student.id,
+        )
+
+    # Email delivery remains separate so an in-app notification failure
+    # cannot prevent the welcome email from being sent.
+    if not user.email:
+        logger.warning(
+            "Welcome email skipped: missing email for student_id=%s",
+            student.id,
+        )
+        return
+
+    try:
+        dedup_key = f"student-welcome:{student.id}"
+        existing = session.scalar(
+            select(NotificationDelivery).where(
+                NotificationDelivery.institution_id == institution.id,
+                NotificationDelivery.dedup_key == dedup_key,
+            )
+        )
+        if existing:
+            logger.info(
+                "Welcome email already logged for student_id=%s; skipping duplicate",
+                student.id,
+            )
+            return
+
+        delivered, error = email_service.send_student_welcome_email(
+            recipient=user.email,
+            recipient_name=user.name,
+            role=user.role,
+            institution_name=institution.name,
+            institution_slug=institution.slug,
+        )
+        session.add(NotificationDelivery(
+            institution_id=institution.id,
+            user_id=user.id,
+            student_id=student.id,
+            channel="email",
+            destination_masked=f"***{user.email[-6:]}",
+            template="student_welcome",
+            status="sent" if delivered else "failed",
+            error=error,
+            sent_at=datetime.now(timezone.utc) if delivered else None,
+            dedup_key=dedup_key,
+        ))
+        session.commit()
+        if not delivered:
+            logger.warning(
+                "Welcome email delivery failed for student_id=%s: %s",
+                student.id,
+                error,
+            )
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Welcome email handling failed for student_id=%s",
+            student.id,
+        )
 
 def department_for_student(session: Session, institution_id: int, department_id: int | None) -> Department | None:
     if not department_id:
@@ -1250,10 +1348,16 @@ def download_student_document(document_id: int, actor: User = Depends(current_us
         raise HTTPException(status.HTTP_423_LOCKED, "Document is quarantined until malware scanning succeeds")
     db.write_audit(session, actor.id, "student_document.downloaded", "student_document", row.id, {"student_id": row.student_id})
     session.commit()
-    local = storage_service.local_path(row.storage_key)
-    if local:
-        return FileResponse(local, media_type=row.mime_type, filename=row.file_name)
-    return {"url": storage_service.download_url(row.storage_key, 300), "expires_in": 300}
+    payload = storage_service.read_private(row.storage_key)
+    encoded_filename = quote(row.file_name or "document", safe="")
+    return Response(
+        content=payload,
+        media_type=row.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.post("/api/auth/logout")
@@ -2146,6 +2250,264 @@ def replace_teacher_assignment(assignment_id: int, payload: TeacherReplacement, 
     db.write_audit(session, actor.id, "teacher_assignment.replaced", "teacher_assignment", next_assignment.id, {"previous_assignment_id": current.id, "previous_teacher_id": current.teacher_id, "new_teacher_id": replacement.id, "reason": payload.reason})
     session.commit()
     return {"id": next_assignment.id, "teacher_id": replacement.id, "previous_assignment_id": current.id, "status": "active"}
+
+
+
+@app.post("/api/admin/academics/progression-batches", status_code=status.HTTP_201_CREATED)
+def create_progression_batch(
+    payload: ProgressionBatchCreate,
+    actor: User = Depends(admin_only),
+    session: Session = Depends(db.get_db),
+):
+    student_ids = payload.student_ids
+    if len(student_ids) != len(set(student_ids)):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Remove duplicate student IDs")
+
+    source_term = session.get(AcademicTerm, payload.source_term_id)
+    destination_term = session.get(AcademicTerm, payload.destination_term_id)
+    destination = session.get(ClassSection, payload.destination_section_id)
+
+    if (
+        not source_term or source_term.institution_id != actor.institution_id
+        or not destination_term or destination_term.institution_id != actor.institution_id
+        or not destination or destination.institution_id != actor.institution_id
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Academic term or destination section not found")
+    # Source terms may be inactive after a semester ends; destination setup must be active.
+    if not destination_term.active or not destination.active:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Destination term and section must be active")
+
+    students = session.scalars(
+        select(Student).where(
+            Student.id.in_(student_ids),
+            Student.institution_id == actor.institution_id,
+        )
+    ).all()
+    student_by_id = {student.id: student for student in students}
+    if len(student_by_id) != len(student_ids):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "One or more students were not found in this institution")
+
+    source_memberships = session.scalars(
+        select(SectionMembership).where(
+            SectionMembership.student_id.in_(student_ids),
+            SectionMembership.term_id == source_term.id,
+            SectionMembership.active.is_(True),
+        )
+    ).all()
+    membership_by_student = {}
+    for membership in source_memberships:
+        if membership.student_id in membership_by_student:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Student {membership.student_id} has multiple active source memberships; resolve them first",
+            )
+        membership_by_student[membership.student_id] = membership
+
+    missing = sorted(set(student_ids) - set(membership_by_student))
+    if missing:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Students need an active membership in source term {source_term.id}: {missing[:20]}",
+        )
+
+    batch = AcademicProgressionBatch(
+        institution_id=actor.institution_id,
+        source_term_id=source_term.id,
+        destination_term_id=destination_term.id,
+        destination_section_id=destination.id,
+        status="pending",
+        created_by=actor.id,
+        reason=payload.reason,
+    )
+    session.add(batch)
+    session.flush()
+
+    for student_id in student_ids:
+        session.add(AcademicProgressionRecord(
+            batch_id=batch.id,
+            student_id=student_id,
+            source_section_id=membership_by_student[student_id].section_id,
+            status="pending",
+        ))
+
+    db.write_audit(
+        session, actor.id, "academic_progression.proposed",
+        "academic_progression_batch", batch.id,
+        {
+            "student_count": len(student_ids),
+            "source_term_id": source_term.id,
+            "destination_term_id": destination_term.id,
+            "destination_section_id": destination.id,
+        },
+    )
+    session.commit()
+    return {
+        "id": batch.id,
+        "status": batch.status,
+        "student_count": len(student_ids),
+        "source_term_id": source_term.id,
+        "destination_term_id": destination_term.id,
+        "destination_section_id": destination.id,
+        "message": "Promotion batch created. Student records have not been changed.",
+    }
+
+
+@app.patch("/api/admin/academics/progression-batches/{batch_id}/review")
+def review_progression_batch(
+    batch_id: int,
+    payload: ProgressionBatchReview,
+    actor: User = Depends(admin_only),
+    session: Session = Depends(db.get_db),
+):
+    # Serialize reviews of the same batch on databases that support row locks.
+    batch = session.scalar(select(AcademicProgressionBatch).where(
+        AcademicProgressionBatch.id == batch_id,
+        AcademicProgressionBatch.institution_id == actor.institution_id,
+    ).with_for_update())
+    if not batch:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Progression batch not found")
+    if batch.status != "pending":
+        raise HTTPException(status.HTTP_409_CONFLICT, "This progression batch has already been reviewed")
+    if payload.decision == "rejected" and not (payload.reason or "").strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A rejection reason is required")
+
+    records = session.scalars(select(AcademicProgressionRecord).where(
+        AcademicProgressionRecord.batch_id == batch.id
+    ).order_by(AcademicProgressionRecord.id)).all()
+    if not records:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The batch has no student records")
+
+    if payload.decision == "rejected":
+        batch.reviewed_by = actor.id
+        batch.reviewed_at = datetime.now(timezone.utc)
+        batch.status = "rejected"
+        if payload.reason:
+            batch.reason = payload.reason
+        for record in records:
+            record.status = "rejected"
+        db.write_audit(
+            session, actor.id, "academic_progression.rejected",
+            "academic_progression_batch", batch.id,
+            {"student_count": len(records), "reason": payload.reason},
+        )
+        session.commit()
+        return {"id": batch.id, "status": batch.status, "students_updated": 0}
+
+    # Approval must move students between distinct academic terms.
+    if batch.source_term_id == batch.destination_term_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Source and destination terms must be different",
+        )
+
+    source_term = session.get(AcademicTerm, batch.source_term_id)
+    destination_term = session.get(AcademicTerm, batch.destination_term_id)
+    destination = session.get(ClassSection, batch.destination_section_id)
+    if (
+        not source_term or source_term.institution_id != actor.institution_id
+        or not destination_term or destination_term.institution_id != actor.institution_id
+        or not destination or destination.institution_id != actor.institution_id
+        or not destination.active or not destination_term.active
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Destination academic setup is no longer valid")
+
+    student_ids = [record.student_id for record in records]
+    students = session.scalars(select(Student).where(
+        Student.id.in_(student_ids),
+        Student.institution_id == actor.institution_id,
+    )).all()
+    student_by_id = {student.id: student for student in students}
+    if len(student_by_id) != len(student_ids):
+        raise HTTPException(status.HTTP_409_CONFLICT, "A student is no longer available in this institution")
+
+    source_memberships = session.scalars(select(SectionMembership).where(
+        SectionMembership.student_id.in_(student_ids),
+        SectionMembership.term_id == batch.source_term_id,
+        SectionMembership.active.is_(True),
+    )).all()
+    active_by_student = {}
+    for membership in source_memberships:
+        if membership.student_id in active_by_student:
+            raise HTTPException(status.HTTP_409_CONFLICT, "A student has multiple active source memberships")
+        active_by_student[membership.student_id] = membership
+
+    for record in records:
+        student = student_by_id.get(record.student_id)
+        current = active_by_student.get(record.student_id)
+        if not student or not current or current.section_id != record.source_section_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Student {record.student_id}'s source membership changed after the batch was prepared; no promotion applied",
+            )
+
+    # All records are validated before any student placement is changed.
+    for record in records:
+        student = student_by_id[record.student_id]
+        for membership in session.scalars(select(SectionMembership).where(
+            SectionMembership.student_id == student.id,
+            SectionMembership.term_id == batch.destination_term_id,
+            SectionMembership.active.is_(True),
+        )).all():
+            membership.active = False
+
+        destination_membership = session.scalar(select(SectionMembership).where(
+            SectionMembership.student_id == student.id,
+            SectionMembership.section_id == destination.id,
+            SectionMembership.term_id == destination_term.id,
+        ))
+        if destination_membership:
+            destination_membership.active = True
+        else:
+            destination_membership = SectionMembership(
+                student_id=student.id,
+                section_id=destination.id,
+                term_id=destination_term.id,
+                active=True,
+            )
+            session.add(destination_membership)
+
+        profile = session.scalar(select(StudentProfile).where(
+            StudentProfile.student_id == student.id
+        ))
+        if profile:
+            profile.current_semester = destination_term.name
+            profile.current_academic_year = destination_term.academic_year
+            profile.year_of_study = str((destination.semester + 1) // 2)
+            # Keep class_name unchanged until its meaning is explicitly defined.
+            profile.section_name = destination.name
+
+        # This helper creates only missing course rows; existing progress is untouched.
+        ensure_section_enrollments(
+            session, student.id, destination.id, destination_term.id
+        )
+        record.status = "approved"
+        record.applied_at = datetime.now(timezone.utc)
+
+    # Set the final batch state only after all approval validations and updates.
+    batch.reviewed_by = actor.id
+    batch.reviewed_at = datetime.now(timezone.utc)
+    batch.status = "approved"
+    if payload.reason:
+        batch.reason = payload.reason
+
+    db.write_audit(
+        session, actor.id, "academic_progression.approved",
+        "academic_progression_batch", batch.id,
+        {
+            "student_count": len(records),
+            "source_term_id": batch.source_term_id,
+            "destination_term_id": batch.destination_term_id,
+            "destination_section_id": destination.id,
+        },
+    )
+    session.commit()
+    return {
+        "id": batch.id,
+        "status": batch.status,
+        "students_updated": len(records),
+        "destination_section_id": destination.id,
+        "message": "Approved progression applied; previous attendance and existing course progress were preserved.",
+    }
 
 
 @app.post("/api/admin/academics/section-memberships", status_code=status.HTTP_201_CREATED)
@@ -3340,6 +3702,7 @@ async def commit_student_import(file: UploadFile = File(...), photos_zip: Upload
     invalid = [row for row in validated if not row["valid"]]
     if invalid: raise HTTPException(400, {"message": "Correct all row errors before importing", "rows": invalid})
     created = updated = 0
+    created_students: list[Student] = []
     stored_keys: list[str] = []
     replaced_photo_keys: list[str] = []
     try:
@@ -3362,6 +3725,7 @@ async def commit_student_import(file: UploadFile = File(...), photos_zip: Upload
                 session.add(account); session.flush()
                 student = Student(institution_id=actor.institution_id, user=account, roll_no=roll, admission_number=data.get("admission_no", "").strip().upper() or None, department=department.name, department_id=department.id)
                 session.add(student); session.flush(); created += 1
+                created_students.append(student)
             profile = session.scalar(select(StudentProfile).where(StudentProfile.student_id == student.id))
             if not profile:
                 profile = StudentProfile(student_id=student.id); session.add(profile)
@@ -3403,6 +3767,8 @@ async def commit_student_import(file: UploadFile = File(...), photos_zip: Upload
         for old_key in replaced_photo_keys:
             try: storage_service.delete_private(old_key)
             except Exception: logger.exception("Failed to remove replaced student profile photo after successful import")
+        for created_student in created_students:
+            send_student_welcome_notification(session, created_student)
     except Exception:
         session.rollback()
         for key in stored_keys:
@@ -3545,6 +3911,7 @@ def create_student(payload: StudentCreate, request: Request, actor: User = Depen
     ensure_section_enrollments(session, student.id, section.id, term.id)
     db.write_audit(session, actor.id, "student.created", "student", student.id, {"roll_no": student.roll_no}, request.client.host if request.client else None)
     commit_or_conflict(session, "Student email, register number or section membership already exists")
+    send_student_welcome_notification(session, student)
     return db.student_to_dict(student)
 
 
