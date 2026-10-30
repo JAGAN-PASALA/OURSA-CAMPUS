@@ -3599,20 +3599,46 @@ def validate_student_import(session: Session, actor: User, rows: list[dict[str, 
             email = f"{roll.lower()}@{department.email_domain}"
         else:
             email = ""
-        if not email or "@" not in email: errors.append("valid email is required for new students, or configure a department email domain")
-        if email in seen_email: errors.append("duplicate email inside file")
-        if roll in seen_roll: errors.append("duplicate registration/roll number inside file")
-        if admission_no and admission_no in seen_admission: errors.append("duplicate admission number inside file")
-        if email: seen_email.add(email)
-        if roll: seen_roll.add(roll)
-        if admission_no: seen_admission.add(admission_no)
-        if existing and email and roll:
-            conflict_query = select(Student.id).join(User, User.id == Student.user_id).where(
+        if email:
+            try:
+                email = normalized_student_email(email, department)
+            except HTTPException as exc:
+                errors.append(str(exc.detail))
+                email = email.strip().lower()
+
+        if not email or "@" not in email:
+            errors.append("valid email is required for new students, or configure a department email domain")
+        if email in seen_email:
+            errors.append("duplicate email inside file")
+        if roll in seen_roll:
+            errors.append("duplicate registration/roll number inside file")
+        if admission_no and admission_no in seen_admission:
+            errors.append("duplicate admission number inside file")
+        if email:
+            seen_email.add(email)
+        if roll:
+            seen_roll.add(roll)
+        if admission_no:
+            seen_admission.add(admission_no)
+
+        if email and "@" in email:
+            account_conflict = select(User.id).where(
+                User.institution_id == actor.institution_id,
+                func.lower(User.email) == email.lower(),
+            )
+            if existing:
+                account_conflict = account_conflict.where(User.id != existing.user_id)
+            if session.scalar(account_conflict):
+                errors.append("email already belongs to another account in this institution (possibly a staff account); use a different student email")
+
+        if existing and roll:
+            conflict_query = select(Student.id).where(
                 Student.institution_id == actor.institution_id,
-                or_(func.lower(User.email) == email, func.lower(Student.roll_no) == roll),
+                func.lower(Student.roll_no) == roll.lower(),
                 Student.id != existing.id,
             )
-            if session.scalar(conflict_query): errors.append("email or registration/roll number belongs to a different student")
+            if session.scalar(conflict_query):
+                errors.append("registration/roll number belongs to a different student")
         if action == "create" and existing: errors.append("student already exists; use action=update or upsert")
         if action == "update" and not existing: errors.append("student to update was not found")
         if action == "upsert": item["action"] = "update" if existing else "create"
